@@ -1,0 +1,364 @@
+# Error handling function to log error messages with timestamp
+# This function provides a standardized way to log error messages with timestamps, aiding in debugging and monitoring.
+# Databricks Documentation: https://docs.databricks.com/dev-tools/databricks-connect.html#logging
+function error() {
+  echo "[$(date +'%Y-%m-%dT%H:%M:%S%z')]: $*"
+}
+
+# Log info messages to STDOUT with timestamp
+# This function provides a standardized way to log informational messages with timestamps, aiding in debugging and monitoring.
+# Databricks Documentation: https://docs.databricks.com/dev-tools/databricks-connect.html#logging
+function info() {
+  echo "[$(date +'%Y-%m-%dT%H:%M:%S%z')]: $*"
+}
+
+# Exports environment variable to /etc/profile
+# First parameter: environment variable name
+# Second parameter: name of property in unravel_db.properties
+# This function sets and persists environment variables for system-wide access.
+# Databricks Documentation: https://docs.databricks.com/administration-guide/cloud-configurations/aws/instance-profiles.html#step-5-set-environment-variables
+function export_prop() {
+    local -n db_props=$3
+    export $1="${db_props[$2]}"
+    sudo echo "export $1=\"${db_props[$2]}\"" >>/etc/profile
+}
+
+# Exports environment variable to /etc/profile
+# First parameter: environment variable name
+# Second parameter: value to assign to variable
+# This function sets and persists environment variables for system-wide access.
+# Databricks Documentation: https://docs.databricks.com/administration-guide/cloud-configurations/aws/instance-profiles.html#step-5-set-environment-variables
+function export_value() {
+    export $1="$2"
+    sudo echo "export $1=\"$2\"" >>/etc/profile
+}
+
+# Returns Java major version
+# Expects one parameter: path to Java executable
+# This function extracts the major version number of the installed Java, which is used for setting appropriate JVM flags.
+# Usage example: JAVA_VER=$(get_java_major_version $JAVA)
+function get_java_major_version() {
+    local jversion
+    base_ver=$($1 -version 2>&1 | sed -E -n 's/.+version.\"(.+)\".*/\1/p')
+    if [ -z "$base_ver" ]; then
+          jversion="0"
+    else
+        base_ver=$(echo $base_ver | sed -E -n 's/([0-9\.]*).*/\1/p')
+        if [[ "$base_ver" == *"."* ]]; then
+            num1=$(echo $base_ver | sed -E -n 's/([1-9][0-9]*)\.([0-9]+).*/\1/p')
+            num2=$(echo $base_ver | sed -E -n 's/([1-9][0-9]*)\.([0-9]+).*/\2/p')
+            if [[ "$num1" == "1" ]]; then
+                jversion="$num2"
+            else
+                jversion="$num1"
+            fi
+        else
+            jversion="$base_ver"
+        fi
+    fi
+    echo $jversion
+}
+
+# Databricks sensor function
+# This function sets up and runs the Unravel data sensor, which collects and sends metrics to the Unravel server.
+function db_sensor() {
+  JAVA_MAJOR_VER=$(get_java_major_version java)
+
+  ROOT="/databricks/unravel/unravel-db-sensor-archive"
+  LOGS_DIR=$ROOT/../logs
+
+  UNRAVEL_HOST=localhost
+  UNRAVEL_PORT=4043
+
+  # Load additional environment settings if available
+  if [ -f $ROOT/env.sh ]; then
+    source $ROOT/env.sh
+  fi
+
+  cd $ROOT || exit
+
+  export UNRAVEL_AES_KEY
+
+  IDENT=unravel_db
+  DAEMON_PROPS="-Dident=$IDENT"
+  DAEMON_PROPS+=" -Dcluster_registry.mode=proxy"
+  DAEMON_PROPS+=" -Dcom.unraveldata.multicluster.default_cluster.enabled=true"
+  DAEMON_PROPS+=" -Dcom.unraveldata.client.rest.ssl.enabled=$UNRAVEL_SSL_ENABLED"
+  DAEMON_PROPS+=" -Dcom.unraveldata.ssl.insecure=$UNRAVEL_INSECURE_SSL"
+  DAEMON_PROPS+=" -DUNRAVEL_TRUST_STORE=$UNRAVEL_TRUST_STORE"
+  DAEMON_PROPS+=" -DUNRAVEL_TRUST_STORE_PASSWORD=$UNRAVEL_TRUST_STORE_PASSWORD"
+  DAEMON_PROPS+=" -Dlog4j2.configurationFile=file://$ROOT/etc/log4j2.properties"
+  DAEMON_PROPS+=" -Dlog_file_prefix=$DB_CLUSTER_ID"
+
+  # Set Java Virtual Machine options
+  JVM_HEAP_OPTS="-Xms512m -Xmx2g"
+  JVM_GC_G1_FLAGS="-XX:+UseG1GC -Xlog:gc=info:file=${LOGS_DIR}/${IDENT}.gc:time,level,tags:filecount=2,filesize=6M"
+  JVM_FLAGS=" ${JVM_HEAP_OPTS} -Xss1m -XX:+ExitOnOutOfMemoryError -XX:+HeapDumpOnOutOfMemoryError -XX:HeapDumpPath=${LOGS_DIR}"
+  if [ "$JAVA_MAJOR_VER" -ge "9" ]; then
+    JVM_FLAGS+=" ${JVM_GC_G1_FLAGS}"
+    JVM_FLAGS+=" --add-opens java.base/java.lang=ALL-UNNAMED"
+    JVM_FLAGS+=" --add-opens java.base/java.lang.invoke=ALL-UNNAMED"
+    JVM_FLAGS+=" --add-opens jdk.management/com.sun.management.internal=ALL-UNNAMED"
+    JVM_FLAGS+=" --add-exports java.security.jgss/sun.security.krb5=ALL-UNNAMED"
+    JVM_FLAGS+=" -Djdk.io.permissionsUseCanonicalPath=true"
+  fi
+
+  # This script (process) will stick around as a nanny
+  FLAP_COUNT=0
+  MINIMUM_RUN_SEC=5
+  while true ; do
+    # Nanny loop to restart the sensor if it crashes
+    START_AT=$(date +%s)
+    java $JVM_FLAGS $DAEMON_PROPS -cp "$ROOT/etc:$ROOT/dlib/bootstrap/*" \
+      com.unraveldata.bootstrap.runtime.Launcher --repository "$ROOT/dlib/unravel" \
+      --module "com.unraveldata.remote.sensors.databricks-sensor:2024.1.0-SNAPSHOT" \
+      --unravel-server "$UNRAVEL_HOST:$UNRAVEL_PORT" > ${LOGS_DIR}/${IDENT}.out  2>&1
+    CHILD_PID=$!
+    # If this script gets INT or TERM, then clean up child process and exit
+    trap 'kill $CHILD_PID; exit 5' SIGINT SIGTERM
+    # Wait for child process to finish
+    wait $CHILD_PID
+    CHILD_RC=$?
+    FINISH_AT=$(date +%s)
+    RUN_SECS=$(($FINISH_AT-$START_AT))
+    echo "$(date '+%Y%m%dT%H%M%S') ${IDENT} died after ${RUN_SECS} seconds" >> ${LOGS_DIR}/${IDENT}.out
+    if [ $CHILD_RC -eq 71 ]; then
+        echo "$(date '+%Y%m%dT%H%M%S') ${IDENT} retcode is 71, indicating no restart required" >> ${LOGS_DIR}/${IDENT}.out
+        exit 71
+      fi
+      if [ $RUN_SECS -lt $MINIMUM_RUN_SEC ]; then
+        FLAP_COUNT=$(($FLAP_COUNT+1))
+        if [ $FLAP_COUNT -gt 10 ]; then
+          echo "$(date '+%Y%m%dT%H%M%S') ${IDENT} died too fast, NOT restarting to avoid flapping" >> ${LOGS_DIR}/${IDENT}.out
+          exit 6
+        fi
+    else
+        FLAP_COUNT=0
+    fi
+    sleep 10
+  done
+}
+
+# Install the Unravel agent
+# This section sets up the Unravel agent, which is crucial for monitoring and analyzing Spark workloads in Databricks.
+# It ensures the agent is only set up on the driver node, as the driver is responsible for managing the Spark cluster.
+# Databricks Documentation: https://docs.databricks.com/administration-guide/clusters/init-scripts.html#cluster-scoped-init-scripts
+if [ $DB_IS_DRIVER = TRUE ]; then
+    echo "$(date) Preparing Unravel Agent ..."
+    sudo cp -r /dbfs/databricks/unravel/unravel-db-sensor-archive /databricks/unravel/unravel-db-sensor-archive
+
+    # Wait and get Spark master UI details
+    # This loop waits for the Spark master parameters to become available, necessary for configuring the Unravel agent.
+    while [ -z $gotparams ]; do
+        echo "$(date) Waiting for Spark master params"
+        if [ -e "/tmp/master-params" ]; then
+            DB_DRIVER_PORT=$(cat /tmp/master-params | cut -d' ' -f2)
+            echo "$(date) DB_DRIVER_PORT=$DB_DRIVER_PORT"
+            gotparams=TRUE
+        fi
+        sleep 2
+    done
+
+    # Wait and get driver resource details
+    # This loop ensures the driver configuration file is available, which contains critical information like memory and core settings.
+    DB_CONF=$DB_HOME/common/conf/deploy.conf
+    COUNTER=1
+    echo "$(date) Waiting for Spark driver conf"
+    while [ ! -f $DB_CONF ] && [ $COUNTER -le 5 ]; do
+        echo "$(date) Waiting for Spark driver conf: RetryCount = $COUNTER ....."
+        ((COUNTER++))
+        sleep 2
+    done
+
+    # Once the configuration file is available, extract the necessary settings
+    if [ -e $DB_CONF ]; then
+        CONF_DRIVER_HEAP_SIZE=$(grep -F "databricks.daemon.chauffeur.driver.heapSizeMB" $DB_CONF | cut -d'=' -f2)
+        driver_cores=$(nproc)
+        echo "$(date) spark-driver-memory=$CONF_DRIVER_HEAP_SIZE"
+        echo "$(date) spark-driver-cores=$driver_cores"
+
+        # Writing Spark config file for streaming Spark metrics
+        # This part writes the configuration settings to a properties file for the Unravel agent.
+        sudo echo "" >> /databricks/unravel/unravel-db-sensor-archive/etc/unravel_db.properties
+        sudo echo "spark-master-host=$DB_DRIVER_IP" >> /databricks/unravel/unravel-db-sensor-archive/etc/unravel_db.properties
+        sudo echo "spark-master-port=$DB_DRIVER_PORT" >> /databricks/unravel/unravel-db-sensor-archive/etc/unravel_db.properties
+        sudo echo "cluster-id=$DB_CLUSTER_ID" >> /databricks/unravel/unravel-db-sensor-archive/etc/unravel_db.properties
+        sudo echo "spark-driver-cores=$driver_cores" >> /databricks/unravel/unravel-db-sensor-archive/etc/unravel_db.properties
+        sudo echo "spark-driver-memory=$CONF_DRIVER_HEAP_SIZE" >> /databricks/unravel/unravel-db-sensor-archive/etc/unravel_db.properties
+
+        # Starting Unravel Agent
+        # This step starts the Unravel agent using the configured properties, enabling it to monitor and analyze Spark workloads.
+        echo "$(date) Starting Unravel Agent..."
+        db_sensor
+        echo "$(date) Done!"
+    else
+        echo "$(date) Error: Unable to retrieve Spark Driver Configuration. Unravel Agent deployment failed!"
+    fi
+fi
+
+# Function to initialize the Unravel Cluster Agent
+# This function initializes the Unravel Cluster Agent, which is essential for comprehensive monitoring and analysis of the cluster.
+function cluster_init() {
+    info "Running Unravel Cluster Init Script...."
+    
+    # Check if the properties file exists
+    # This file contains configuration settings needed for the Unravel agent.
+    PROP_FILE=/dbfs/databricks/unravel/unravel-db-sensor-archive/etc/unravel_db.properties
+    if [ ! -f ${PROP_FILE} ]; then
+        error "Unravel properties ${PROP_FILE} doesn't exist!"
+        exit 0
+    else
+        info "unravel_db.properties was found"
+    fi
+
+    # Load the properties into an associative array
+    declare -A props
+    while read prop_line; do
+        [[ -z $prop_line ]] && continue
+        [[ $prop_line =~ ^#.* ]] && continue
+        IFS='=' read -r prop_key prop_value <<< "$prop_line"
+        props[$prop_key]=$prop_value
+    done < $PROP_FILE
+    info "unravel_db.properties was loaded successfully"
+
+    # Check if the AES key file exists and export the key if found
+    AES_KEY_FILE=/dbfs/databricks/unravel/unravel-db-sensor-archive/etc/aes_key
+    if [ -f "${AES_KEY_FILE}" ]; then
+        info "unravel key was found"
+        aes_key=$(cat $AES_KEY_FILE)
+        export_value 'UNRAVEL_AES_KEY' $aes_key
+    fi
+
+    # Log cluster and driver information for debugging purposes
+    info "Cluster ID: $DB_CLUSTER_ID"
+    info "Driver IP: $DB_DRIVER_IP"
+    info "Is Driver: $DB_IS_DRIVER"
+
+    # Export critical environment variables
+    export_value 'UNRAVEL_CLUSTER_ID' $DB_CLUSTER_ID
+    export_value 'UNRAVEL_DRIVER_IP' $DB_DRIVER_IP
+
+    # Add LR, Authentication, and TLS to environment variables
+    # These settings are necessary for secure communication between the Unravel agent and the Unravel server.
+    export_prop 'UNRAVEL_LR_HOST_PORT' 'unravel-server' props
+    export_prop 'UNRAVEL_AUTH_METHOD' 'UNRAVEL_AUTH_METHOD' props
+    export_prop 'UNRAVEL_AUTH_USERNAME' 'UNRAVEL_AUTH_USERNAME' props
+    export_prop 'UNRAVEL_AUTH_PASSWORD' 'UNRAVEL_AUTH_PASSWORD' props
+    export_prop 'UNRAVEL_SSL_ENABLED' 'ssl_enabled' props
+    export_prop 'UNRAVEL_INSECURE_SSL' 'insecure_ssl' props
+    export_prop 'UNRAVEL_TRUST_STORE' 'UNRAVEL_TRUST_STORE' props
+    export_prop 'UNRAVEL_TRUST_STORE_PASSWORD' 'UNRAVEL_TRUST_STORE_PASSWORD' props
+    export_prop 'UNRAVEL_TRUST_STORE_PASSWORD_FILE' 'UNRAVEL_TRUST_STORE_PASSWORD_FILE' props
+    export_prop 'UNRAVEL_RESOLVE_HOSTNAME' 'lr_client.resolve_hostname' props
+    export_prop 'UNRAVEL_COMPRESSION_TYPE' 'lr_client.compression_type' props
+    export_value 'UNRAVEL_LR_CONN_TIMEOUT_MS' 1000
+    export_value 'UNRAVEL_LR_READ_TIMEOUT_MS' 3500
+    export_value 'UNRAVEL_LR_SHUTDOWN_MS' 300
+    info "environment variables were exported successfully"
+
+    # Create necessary directories and copy JAR files
+    # These steps ensure that the Unravel agent has all the necessary files and directories it needs to operate.
+    sudo mkdir -p /databricks/unravel/logs
+    sudo mkdir -p /databricks/unravel/eventLogs
+    sudo cp -r /dbfs/databricks/unravel/unravel-agent-pack-bin /databricks/unravel/unravel-agent-pack-bin
+
+    # Run Sensor if the current node is the driver
+    # This ensures the Unravel agent is only started on the driver node.
+    if [ $DB_IS_DRIVER ]; then
+        start_unravel 2>&1 & disown
+    fi
+
+    info "Done!"
+}
+
+# Function to initialize the Unravel Spark Agent
+# This function deploys the Unravel Spark Agent, which collects detailed Spark metrics and sends them to the Unravel server.
+function spark_init() {
+  #!/bin/bash
+  #
+  # Deploys Unravel Spark Agent
+  # Databricks Documentation: https://docs.databricks.com/administration-guide/clusters/init-scripts.html
+
+  info "Running Unravel Spark Init Script..."
+
+  # Check if the Unravel btrace agent jar file exists
+  # The btrace agent is used for instrumenting Java bytecode to collect metrics.
+  BTRACE_FILE=/databricks/unravel/unravel-agent-pack-bin/btrace-agent.jar
+  if [ ! -f ${BTRACE_FILE} ]; then
+    error "Unravel btrace ${BTRACE_FILE} doesn't exist!"
+    exit 0
+  fi
+# Set readonly variables for Unravel configuration
+# These variables define essential configuration settings for the Unravel agent, ensuring it can properly monitor and analyze Spark workloads.
+readonly spark_version
+readonly conn_timeout=1000
+readonly read_timeout=3000
+readonly shutdown_delay=300
+readonly lr_endpoint=127.0.0.1:4043
+readonly resolve_hostname=false
+
+# Ganglia metrics polling has been deprecated in Databricks 13.x onwards
+# Ganglia was previously used for collecting cluster metrics, but it is now deprecated in newer Databricks versions.
+# readonly ganglia_enabled=true
+
+# Path to the Unravel btrace agent jar file
+readonly UD_AGENT_PATH=/databricks/unravel/unravel-agent-pack-bin/btrace-agent.jar
+
+# Java agent options for the driver and executor
+# These options configure the Unravel agent to monitor driver and executor processes in Spark.
+readonly UD_DRIVER_OPTIONS="-javaagent:${UD_AGENT_PATH}=config=driver,script=StreamingProbe.btclass,libs=spark-${spark_version}"
+readonly UD_EXECUTOR_OPTIONS="-javaagent:${UD_AGENT_PATH}=config=executor,libs=spark-${spark_version}"
+
+# Export Unravel configuration variables to /etc/profile
+# These exports ensure that the Unravel configuration settings are available system-wide, making them accessible to all processes.
+# Databricks Documentation: https://docs.databricks.com/administration-guide/cloud-configurations/aws/instance-profiles.html#step-5-set-environment-variables
+sudo echo "export UNRAVEL_LR_CONN_TIMEOUT_MS=${conn_timeout}" >>/etc/profile
+sudo echo "export UNRAVEL_LR_READ_TIMEOUT_MS=${read_timeout}" >>/etc/profile
+sudo echo "export UNRAVEL_LR_SHUTDOWN_MS=${shutdown_delay}" >>/etc/profile
+sudo echo "export UNRAVEL_RESOLVE_HOSTNAME=${resolve_hostname}" >>/etc/profile
+
+# Ganglia metrics polling has been deprecated in Databricks 13.x onwards
+# If the Ganglia metrics were enabled, they would be exported here, but this step is skipped due to deprecation.
+# if [ ${DB_IS_DRIVER} = TRUE ]; then
+#   sudo echo "export UNRAVEL_GANGLIA_ENABLED=${ganglia_enabled}" >>/etc/profile
+# fi
+
+# TODO: Check if defaultJavaOptions is in use and exit.
+# This step would involve checking if the default Java options are already set and exiting if they are.
+
+# Add Unravel Driver configuration to Spark driver setup script
+# This command modifies the Spark driver setup script to include the Unravel driver options, ensuring the agent is initialized with the driver.
+# Databricks Documentation: https://docs.databricks.com/administration-guide/clusters/init-scripts.html#cluster-scoped-init-scripts
+info "Adding Unravel Driver Conf..."
+sed -i "s|\${SPARK_JAVA_OPTS} \${CONF_DRIVER_JAVA_OPTS}|\${SPARK_JAVA_OPTS} ${UD_DRIVER_OPTIONS} \${CONF_DRIVER_JAVA_OPTS}|" /databricks/spark/scripts/setup_driver.sh
+
+# Add Unravel Executor configuration to Spark configuration file
+# This command creates a custom Spark configuration file that includes the Unravel executor options, ensuring the agent is initialized with each executor.
+# Databricks Documentation: https://docs.databricks.com/administration-guide/clusters/init-scripts.html#cluster-scoped-init-scripts
+info "Adding Unravel Spark Conf..."
+cat <<EOF >/databricks/driver/conf/00-custom-ud-spark.conf
+[driver] {
+    "spark.driver.defaultJavaOptions" = "${UD_DRIVER_OPTIONS}"
+    "spark.executor.defaultJavaOptions" = "${UD_EXECUTOR_OPTIONS}"
+}
+EOF
+info "Done!"
+
+# Run Unravel initialization scripts
+# Wait for the /dbfs directory to be available before proceeding
+# This loop ensures that the Databricks File System (DBFS) is mounted before continuing with the script, as the DBFS is required for accessing necessary files.
+# Databricks Documentation: https://docs.databricks.com/data/databricks-file-system.html#dbfs
+COUNTER=1
+while [ ! -d "/dbfs" ] && [ $COUNTER -le 20 ]; do
+  echo "$(date) Waiting for dbfs mount: RetryCount = ${COUNTER} ....."
+  ((COUNTER++))
+  sleep 0.1
+done
+
+# Call the cluster_init function to initialize the Unravel Cluster Agent
+# This function sets up the Unravel Cluster Agent, enabling comprehensive monitoring and analysis of the cluster.
+cluster_init
+
+# Call the spark_init function to initialize the Unravel Spark Agent
+# This function sets up the Unravel Spark Agent, enabling detailed Spark metrics collection and analysis.
+spark_init
