@@ -323,9 +323,6 @@ sudo echo "export UNRAVEL_RESOLVE_HOSTNAME=${resolve_hostname}" >>/etc/profile
 #   sudo echo "export UNRAVEL_GANGLIA_ENABLED=${ganglia_enabled}" >>/etc/profile
 # fi
 
-# TODO: Check if defaultJavaOptions is in use and exit.
-# This step would involve checking if the default Java options are already set and exiting if they are.
-
 # Add Unravel Driver configuration to Spark driver setup script
 # This command modifies the Spark driver setup script to include the Unravel driver options, ensuring the agent is initialized with the driver.
 # Databricks Documentation: https://docs.databricks.com/administration-guide/clusters/init-scripts.html#cluster-scoped-init-scripts
